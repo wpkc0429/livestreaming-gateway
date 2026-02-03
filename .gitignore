@@ -1,0 +1,29 @@
+# === 1. 編譯產物 (Binaries) ===
+# 根據你的列表，這兩個是執行檔
+gateway
+livestreaming-gateway
+# 通用的執行檔忽略
+gateway_unix
+gateway_linux
+*.exe
+
+# === 2. 環境變數與敏感資訊 (Secrets) ===
+.env
+# 雖然 .env.example 要保留，但建議統一忽略所有 .env 開頭的實體設定檔
+.env.local
+
+# === 3. 備份與暫存檔 (Temporary files) ===
+*.bak
+*.tmp
+*~
+
+# === 4. Go 相關 (Go specific) ===
+# 效能分析數據與測試覆蓋率
+*.out
+*.prof
+*.test
+
+# === 5. 編輯器設定 (IDE) ===
+.idea/
+.vscode/
+.DS_Store
