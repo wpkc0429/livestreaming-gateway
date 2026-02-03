@@ -3,13 +3,14 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,7 +20,6 @@ import (
 	"github.com/patrickmn/go-cache"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
-	_ "github.com/go-sql-driver/mysql"
 )
 
 const (
@@ -55,50 +55,57 @@ func init() {
 // DB & Cache Repositories
 // ---------------------------
 
-// StreamRepository defines the interface for looking up stream destinations
+// StreamInfo contains the quota and destinations for a stream
+type StreamInfo struct {
+	Key             string    `json:"key"`
+	Quota           int64     `json:"quota"`
+	DestinationURLs []string  `json:"destination_urls"`
+	CachedAt        time.Time `json:"cached_at"`
+}
+
+// StreamRepository defines the interface for looking up stream configuration
 type StreamRepository interface {
-	GetDestinations(streamPath string) ([]string, error)
+	GetStreamInfo(streamPath string) (*StreamInfo, error)
 }
 
-// MySQLRepository implements StreamRepository backed by a MySQL database provided by user.
-// Table Schema (Assumed):
-// CREATE TABLE stream_mappings (
-//   id INT AUTO_INCREMENT PRIMARY KEY,
-//   stream_key VARCHAR(255) NOT NULL, -- e.g. "/live/test"
-//   destination_url TEXT NOT NULL     -- e.g. "rtmp://target/app/key"
-// );
-type MySQLRepository struct {
-	db *sql.DB
+// APIRepository implements StreamRepository backed by an external API
+type APIRepository struct {
+	baseURL string
+	client  *http.Client
 }
 
-func NewMySQLRepository(dsn string) (*MySQLRepository, error) {
-	db, err := sql.Open("mysql", dsn)
+func NewAPIRepository(baseURL string) *APIRepository {
+	return &APIRepository{
+		baseURL: baseURL,
+		client:  &http.Client{Timeout: 5 * time.Second},
+	}
+}
+
+func (r *APIRepository) GetStreamInfo(path string) (*StreamInfo, error) {
+	// Construct API URL: e.g. http://api.internal/stream?key=/live/test
+	u, err := url.Parse(r.baseURL)
 	if err != nil {
 		return nil, err
 	}
-	if err := db.Ping(); err != nil {
-		return nil, err
-	}
-	return &MySQLRepository{db: db}, nil
-}
+	q := u.Query()
+	q.Set("key", path)
+	u.RawQuery = q.Encode()
 
-func (r *MySQLRepository) GetDestinations(path string) ([]string, error) {
-	// Query DB for all destinations for this path
-	rows, err := r.db.Query("SELECT destination_url FROM stream_mappings WHERE stream_key = ?", path)
+	resp, err := r.client.Get(u.String())
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer resp.Body.Close()
 
-	var dests []string
-	for rows.Next() {
-		var dest string
-		if err := rows.Scan(&dest); err != nil {
-			return nil, err
-		}
-		dests = append(dests, dest)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API returned status: %d", resp.StatusCode)
 	}
-	return dests, nil
+
+	var info StreamInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return nil, err
+	}
+	return &info, nil
 }
 
 // RedisRepository acts as L2 Cache: Redis -> Inner(MySQL)
@@ -114,44 +121,58 @@ func NewRedisRepository(inner StreamRepository, client *redis.Client) *RedisRepo
 	}
 }
 
-func (r *RedisRepository) GetDestinations(path string) ([]string, error) {
+func (r *RedisRepository) GetStreamInfo(path string) (*StreamInfo, error) {
 	ctx := context.Background() // lightweight ctx for redis ops
+	infoKey := "info:" + path
 
 	// 1. Check Redis
-	val, err := r.client.Get(ctx, path).Result()
+	val, err := r.client.Get(ctx, infoKey).Result()
+	var cacheInfo StreamInfo
+	var cacheHit bool
+
 	if err == nil {
-		var dests []string
-		if jsonErr := json.Unmarshal([]byte(val), &dests); jsonErr == nil {
-			logger.Debug("L2 Redis Cache hit", zap.String("path", path))
-			return dests, nil
+		if jsonErr := json.Unmarshal([]byte(val), &cacheInfo); jsonErr == nil {
+			cacheHit = true
+			if time.Since(cacheInfo.CachedAt) < 10*time.Minute {
+				logger.Debug("L2 Redis Cache hit (Fresh)", zap.String("path", path))
+				return &cacheInfo, nil
+			}
+			logger.Warn("L2 Redis Cache hit (Stale), attempting refresh", zap.String("path", path))
 		}
 	} else if err != redis.Nil {
 		logger.Warn("Redis get error", zap.Error(err))
 	}
 
-	// 2. Fallback to Inner (MySQL)
-	dests, err := r.inner.GetDestinations(path)
-	if err != nil {
-		return nil, err
+	// 2. Fetch from Inner (API)
+	info, fetchErr := r.inner.GetStreamInfo(path)
+
+	// SWR Resilience Logic
+	if fetchErr != nil {
+		if cacheHit {
+			logger.Warn("L3 API Failed, serving stale data", zap.String("path", path), zap.Error(fetchErr))
+			return &cacheInfo, nil
+		}
+		return nil, fetchErr
 	}
 
-	// 3. Cache in Redis
-	// Cache valid results for 10 minutes.
-	// Empty results can also be cached if we want global protection.
-	ttl := 10 * time.Minute
-	if len(dests) == 0 {
-		ttl = 1 * time.Minute // Shorter TTL for empty results
+	// 3. Cache in Redis (Refresh)
+	info.CachedAt = time.Now()
+
+	// Physical TTL: 24h (Longer than logical TTL 10m to allow SWR)
+	ttl := 24 * time.Hour
+	if len(info.DestinationURLs) == 0 {
+		ttl = 10 * time.Minute // Shorter for empty results
 	}
 
-	if data, err := json.Marshal(dests); err == nil {
-		if err := r.client.Set(ctx, path, data, ttl).Err(); err != nil {
+	if data, err := json.Marshal(info); err == nil {
+		if err := r.client.Set(ctx, infoKey, data, ttl).Err(); err != nil {
 			logger.Warn("Redis set error", zap.Error(err))
 		} else {
 			logger.Debug("L2 Redis populated", zap.String("path", path))
 		}
 	}
 
-	return dests, nil
+	return info, nil
 }
 
 // CachedRepository decorates a StreamRepository with in-memory caching (L1)
@@ -167,34 +188,34 @@ func NewCachedRepository(inner StreamRepository, defaultExpiration, cleanupInter
 	}
 }
 
-func (r *CachedRepository) GetDestinations(path string) ([]string, error) {
+func (r *CachedRepository) GetStreamInfo(path string) (*StreamInfo, error) {
 	// L1 Cache Logic
 	if val, found := r.cache.Get(path); found {
-		dests := val.([]string)
-		if len(dests) == 0 {
+		info := val.(*StreamInfo)
+		if len(info.DestinationURLs) == 0 {
 			logger.Debug("L1 Local Cache hit (bloomed empty)", zap.String("path", path))
 		} else {
 			logger.Debug("L1 Local Cache hit", zap.String("path", path))
 		}
-		return dests, nil
+		return info, nil
 	}
 
-	// Fallback to L2 (Redis) -> L3 (MySQL)
-	dests, err := r.inner.GetDestinations(path)
+	// Fallback to L2 (Redis) -> L3 (API)
+	info, err := r.inner.GetStreamInfo(path)
 	if err != nil {
 		return nil, err
 	}
 
 	// Cache Result in L1
-	if len(dests) > 0 {
-		r.cache.Set(path, dests, cache.DefaultExpiration)
+	if len(info.DestinationURLs) > 0 {
+		r.cache.Set(path, info, cache.DefaultExpiration)
 		logger.Debug("L1 Local Cache populated", zap.String("path", path))
 	} else {
-		r.cache.Set(path, dests, 30*time.Second)
+		r.cache.Set(path, info, 30*time.Second)
 		logger.Debug("L1 Local Cache populated (bloomed empty)", zap.String("path", path))
 	}
 
-	return dests, nil
+	return info, nil
 }
 
 func (r *CachedRepository) Invalidate(path string) {
@@ -246,13 +267,13 @@ func (t *TrafficTracker) Flush() {
 	}
 
 	// Redis: Incremental (Monthly)
-	// Key: usage:monthly:2023-10:/live/test
-	monthKey := fmt.Sprintf("usage:monthly:%s:%s", now.Format("2006-01"), t.streamKey)
+	// Key: usage:/live/test
+	usageKey := fmt.Sprintf("usage:%s", t.streamKey)
 	ctx := context.Background()
 
 	pipe := t.redisClient.Pipeline()
-	pipe.IncrBy(ctx, monthKey, bytes)
-	pipe.Expire(ctx, monthKey, 60*24*time.Hour) // Keep for 60 days
+	pipe.IncrBy(ctx, usageKey, bytes)
+	pipe.Expire(ctx, usageKey, 60*24*time.Hour) // Keep for 60 days
 	if _, err := pipe.Exec(ctx); err != nil {
 		logger.Error("Failed to update Redis traffic", zap.Error(err))
 	}
@@ -452,15 +473,42 @@ func startStreamForwarding(conn *rtmp.Conn) {
 	defer conn.Close()
 
 	// 1. Resolve Destinations using Repository (MySQL + Redis + Cache)
-	destUrls, err := streamRepo.GetDestinations(conn.URL.Path)
+	info, err := streamRepo.GetStreamInfo(conn.URL.Path)
 	if err != nil {
 		logger.Error("DB/Cache Lookup Failed", zap.Error(err))
 		return
 	}
-	if len(destUrls) == 0 {
+	if len(info.DestinationURLs) == 0 {
 		logger.Warn("No mapping found", zap.String("path", conn.URL.Path))
 		return
 	}
+
+	// 1.5 Quota Check
+	// Key: usage:/live/test
+	usageKey := fmt.Sprintf("usage:%s", conn.URL.Path)
+	val, err := globalRedis.Get(context.Background(), usageKey).Result()
+
+	var currentUsage int64
+	if err == nil {
+		if v, parseErr := strconv.ParseInt(strings.TrimSpace(val), 10, 64); parseErr == nil {
+			currentUsage = v
+		} else {
+			logger.Error("Failed to parse quota usage", zap.Error(parseErr))
+		}
+	} else if err != redis.Nil {
+		logger.Error("Failed to check quota usage", zap.Error(err))
+	}
+
+	// 10% tolerance error margin (User Request: currentUsage * 1.1)
+	if float64(currentUsage)*1.1 >= float64(info.Quota) {
+		logger.Warn("Stream quota exceeded",
+			zap.String("path", conn.URL.Path),
+			zap.Int64("usage", currentUsage),
+			zap.Int64("quota", info.Quota))
+		return
+	}
+
+	destUrls := info.DestinationURLs
 
 	var writers []*AsyncPacketWriter
 	ctx, cancel := context.WithCancel(context.Background())
@@ -516,8 +564,19 @@ func startStreamForwarding(conn *rtmp.Conn) {
 			break
 		}
 
-		// Count Traffic
-		tracker.Add(len(pkt.Data))
+		// Count Traffic (Async Flush)
+		payloadLen := len(pkt.Data)
+		tracker.Add(payloadLen)
+
+		// Real-time Quota Check (Memory-based)
+		currentUsage += int64(payloadLen)
+		if float64(currentUsage)*1.1 >= float64(info.Quota) {
+			logger.Warn("Stream quota exceeded (runtime)",
+				zap.String("path", conn.URL.Path),
+				zap.Int64("usage", currentUsage),
+				zap.Int64("quota", info.Quota))
+			break
+		}
 
 		broadcaster.WritePacket(pkt)
 	}
@@ -532,15 +591,10 @@ func startStreamForwarding(conn *rtmp.Conn) {
 func main() {
 	defer logger.Sync()
 
-	// 1. Initialize DB + Cache Layering
-	dsn := os.Getenv("MYSQL_DSN")
-	if dsn == "" {
-		logger.Fatal("MYSQL_DSN environment variable is required")
-	}
-
-	mysqlRepo, err := NewMySQLRepository(dsn)
-	if err != nil {
-		logger.Fatal("Failed to connect to MySQL", zap.Error(err))
+	apiURL := os.Getenv("STREAM_API_URL")
+	if apiURL == "" {
+		apiURL = "http://localhost:8081/mock_l3"
+		logger.Info("Using default Mock API URL", zap.String("url", apiURL))
 	}
 
 	redisAddr := os.Getenv("REDIS_ADDR")
@@ -553,11 +607,12 @@ func main() {
 	})
 	globalRedis = rdb
 
-	// Chain: Local(L1) -> Redis(L2) -> MySQL(L3)
-	redisRepo := NewRedisRepository(mysqlRepo, rdb)
+	// Chain: Local(L1) -> Redis(L2) -> API(L3)
+	apiRepo := NewAPIRepository(apiURL)
+	redisRepo := NewRedisRepository(apiRepo, rdb)
 	streamRepo = NewCachedRepository(redisRepo, 5*time.Minute, 10*time.Minute)
 
-	logger.Info("Stream Repository Initialized (MySQL + Redis + LocalCache)")
+	logger.Info("Stream Repository Initialized (API + Redis + LocalCache)")
 
 	// 2. Start Redis Pub/Sub Listener
 	go func() {
@@ -596,6 +651,28 @@ func main() {
 				return
 			}
 			fmt.Fprintf(w, "Published invalidation for: %s", path)
+		})
+
+		// Mock L3 API
+		http.HandleFunc("/mock_l3", func(w http.ResponseWriter, r *http.Request) {
+			key := r.URL.Query().Get("key")
+			if key == "" {
+				http.Error(w, "missing key", http.StatusBadRequest)
+				return
+			}
+
+			// Sample Response
+			resp := StreamInfo{
+				Key:   key,
+				Quota: 1024 * 1024 * 50, // 50MB
+				DestinationURLs: []string{
+					"rtmps://252656b2b64e.global-contribute.live-video.net:443/app/sk_ap-northeast-1_SpghWWQG9Hms_17UHQatYdcsaVGeyczjsfMfEcdagCU",
+					"rtmps://252656b2b64e.global-contribute.live-video.net:443/app/sk_ap-northeast-1_uYwVq6KdDCjd_5cWUXRqFa04dF5pE4d9WEtPUFTLufb",
+				},
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(resp)
 		})
 
 		logger.Info("Health check & Admin API listening", zap.String("addr", ":8081"))
