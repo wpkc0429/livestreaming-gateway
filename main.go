@@ -675,22 +675,31 @@ func main() {
 			json.NewEncoder(w).Encode(resp)
 		})
 
-		logger.Info("Health check & Admin API listening", zap.String("addr", ":8081"))
-		if err := http.ListenAndServe(":8081", nil); err != nil {
+		httpAddr := os.Getenv("HTTP_ADDR")
+		if httpAddr == "" {
+			httpAddr = ":8081"
+		}
+
+		logger.Info("Health check & Admin API listening", zap.String("addr", httpAddr))
+		if err := http.ListenAndServe(httpAddr, nil); err != nil {
 			logger.Error("Health check server failed", zap.Error(err))
 		}
 	}()
 
-	addr := ":1935"
+	rtmpAddr := os.Getenv("RTMP_ADDR")
+	if rtmpAddr == "" {
+		rtmpAddr = ":1935"
+	}
+
 	server := &rtmp.Server{
-		Addr: addr,
+		Addr: rtmpAddr,
 	}
 
 	server.HandlePublish = func(conn *rtmp.Conn) {
 		startStreamForwarding(conn)
 	}
 
-	logger.Info("RTMP Gateway (Async/Multi-Dest/DB-Redis-Map) listening", zap.String("addr", addr))
+	logger.Info("RTMP Gateway (Async/Multi-Dest/DB-Redis-Map) listening", zap.String("addr", rtmpAddr))
 	if err := server.ListenAndServe(); err != nil {
 		logger.Fatal("Server failed", zap.Error(err))
 	}
