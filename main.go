@@ -30,11 +30,25 @@ const (
 var logger *zap.Logger
 
 func init() {
-	var err error
-	logger, err = zap.NewProduction()
-	if err != nil {
-		panic(err)
-	}
+	var config zap.Config
+
+    // 根據環境變數決定使用 Production 或 Development 配置
+    if os.Getenv("ENV") == "production" {
+        config = zap.NewProductionConfig()
+    } else {
+        config = zap.NewDevelopmentConfig()
+    }
+
+    // 手動設定等級（如果環境變數有設 DEBUG=true 就開 Debug）
+    if os.Getenv("DEBUG") == "true" {
+        config.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
+    }
+
+    var err error
+    logger, err = config.Build()
+    if err != nil {
+        panic(err)
+    }
 }
 
 // ---------------------------
@@ -93,13 +107,10 @@ type RedisRepository struct {
 	client *redis.Client
 }
 
-func NewRedisRepository(inner StreamRepository, addr string) *RedisRepository {
-	rdb := redis.NewClient(&redis.Options{
-		Addr: addr,
-	})
+func NewRedisRepository(inner StreamRepository, client *redis.Client) *RedisRepository {
 	return &RedisRepository{
 		inner:  inner,
-		client: rdb,
+		client: client,
 	}
 }
 
@@ -186,8 +197,81 @@ func (r *CachedRepository) GetDestinations(path string) ([]string, error) {
 	return dests, nil
 }
 
+func (r *CachedRepository) Invalidate(path string) {
+	r.cache.Delete(path)
+	logger.Info("L1 Local Cache invalidated", zap.String("path", path))
+}
+
 // Global repo instance
-var streamRepo StreamRepository
+var streamRepo *CachedRepository
+var globalRedis *redis.Client
+
+// ---------------------------
+// Traffic Logging
+// ---------------------------
+
+type TrafficTracker struct {
+	streamKey   string
+	bytes       int64
+	mu          sync.Mutex
+	redisClient *redis.Client
+	lastFlush   time.Time
+}
+
+func NewTrafficTracker(streamKey string, rdb *redis.Client) *TrafficTracker {
+	return &TrafficTracker{
+		streamKey:   streamKey,
+		redisClient: rdb,
+		lastFlush:   time.Now(),
+	}
+}
+
+func (t *TrafficTracker) Add(n int) {
+	t.mu.Lock()
+	t.bytes += int64(n)
+	t.mu.Unlock()
+}
+
+func (t *TrafficTracker) Flush() {
+	t.mu.Lock()
+	bytes := t.bytes
+	t.bytes = 0
+	// lastFlush := t.lastFlush // Unused if we don't log to DB
+	now := time.Now()
+	t.lastFlush = now
+	t.mu.Unlock()
+
+	if bytes == 0 {
+		return
+	}
+
+	// Redis: Incremental (Monthly)
+	// Key: usage:monthly:2023-10:/live/test
+	monthKey := fmt.Sprintf("usage:monthly:%s:%s", now.Format("2006-01"), t.streamKey)
+	ctx := context.Background()
+
+	pipe := t.redisClient.Pipeline()
+	pipe.IncrBy(ctx, monthKey, bytes)
+	pipe.Expire(ctx, monthKey, 60*24*time.Hour) // Keep for 60 days
+	if _, err := pipe.Exec(ctx); err != nil {
+		logger.Error("Failed to update Redis traffic", zap.Error(err))
+	}
+}
+
+func (t *TrafficTracker) StartTicker(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			t.Flush() // Final flush
+			return
+		case <-ticker.C:
+			t.Flush()
+		}
+	}
+}
 
 // ---------------------------
 // Existing Gateway Logic
@@ -382,6 +466,10 @@ func startStreamForwarding(conn *rtmp.Conn) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Traffic Tracker
+	tracker := NewTrafficTracker(conn.URL.Path, globalRedis)
+	go tracker.StartTicker(ctx, 10*time.Second)
+
 	// 2. Prepare Headers (Streams)
 	streams, err := conn.Streams()
 	if err != nil {
@@ -428,6 +516,9 @@ func startStreamForwarding(conn *rtmp.Conn) {
 			break
 		}
 
+		// Count Traffic
+		tracker.Add(len(pkt.Data))
+
 		broadcaster.WritePacket(pkt)
 	}
 
@@ -457,20 +548,57 @@ func main() {
 		redisAddr = "localhost:6379"
 	}
 
+	rdb := redis.NewClient(&redis.Options{
+		Addr: redisAddr,
+	})
+	globalRedis = rdb
+
 	// Chain: Local(L1) -> Redis(L2) -> MySQL(L3)
-	redisRepo := NewRedisRepository(mysqlRepo, redisAddr)
+	redisRepo := NewRedisRepository(mysqlRepo, rdb)
 	streamRepo = NewCachedRepository(redisRepo, 5*time.Minute, 10*time.Minute)
 
 	logger.Info("Stream Repository Initialized (MySQL + Redis + LocalCache)")
 
-	// 2. Start Health Check Server
+	// 2. Start Redis Pub/Sub Listener
+	go func() {
+		pubsub := rdb.Subscribe(context.Background(), "stream_updates")
+		defer pubsub.Close()
+
+		ch := pubsub.Channel()
+		logger.Info("Subscribed to Redis active invalidation channel", zap.String("channel", "stream_updates"))
+
+		for msg := range ch {
+			path := msg.Payload
+			logger.Info("Received invalidation signal", zap.String("path", path))
+			streamRepo.Invalidate(path)
+		}
+	}()
+
+	// 3. Start Health Check Server + Sim Update API
 	go func() {
 		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			count := atomic.LoadInt64(&activeStreams)
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprintf(w, "OK. Active Streams: %d\n", count)
 		})
-		logger.Info("Health check listening", zap.String("addr", ":8081"))
+
+		// Helper to simulate DB update and broadcast
+		http.HandleFunc("/api/sim_update", func(w http.ResponseWriter, r *http.Request) {
+			path := r.URL.Query().Get("path")
+			if path == "" {
+				http.Error(w, "missing path", http.StatusBadRequest)
+				return
+			}
+			// Publish to Redis
+			err := rdb.Publish(context.Background(), "stream_updates", path).Err()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			fmt.Fprintf(w, "Published invalidation for: %s", path)
+		})
+
+		logger.Info("Health check & Admin API listening", zap.String("addr", ":8081"))
 		if err := http.ListenAndServe(":8081", nil); err != nil {
 			logger.Error("Health check server failed", zap.Error(err))
 		}
